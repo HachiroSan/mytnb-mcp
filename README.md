@@ -5,9 +5,10 @@
 
 This project is **not affiliated with or endorsed by TNB**. It is a small,
 self-contained library built against observed public portal responses. It has
-one runtime dependency (`httpx`), uses only the standard library everywhere
-else, and never performs unattended authentication: credentials are supplied
-per call, used once, and never stored.
+one core runtime dependency (`httpx`); the optional MCP server adds the official
+MCP Python SDK. SDK callers supply credentials per login call. The MCP server
+reads credentials from its environment when a tool first needs authentication;
+neither stores credentials on the client or writes them to disk.
 
 > The login, account-listing, and bill flows have been validated end-to-end
 > against the live portal. The offline test suite uses invented fixtures only.
@@ -22,12 +23,14 @@ Implemented:
   terminating pagination.
 - `MyTNBClient.get_bills(account, months=6)` — historical **bills** parsed from
   the portal's embedded payment-history model (HTML), excluding payments.
+- `mytnb-mcp` — optional local stdio MCP server with `list_accounts` and
+  `get_bills` tools.
 
 Deliberately **not** implemented (unverified or out of scope): the POST
-history-filter endpoint, PDF retrieval, a CLI, a scheduler, a database, any
+history-filter endpoint, PDF retrieval, a general-purpose CLI, a scheduler, a database, any
 speculative backend abstraction, and any attempt to solve or bypass a
-CAPTCHA/OTP/two-factor challenge. An MCP server is **planned but not currently
-available**.
+CAPTCHA/OTP/two-factor challenge. The MCP server doesn't expose payments or an
+HTTP listener.
 
 ## Install
 
@@ -70,6 +73,72 @@ with MyTNBClient(cookies={"<session-cookie-name>": os.environ["MYTNB_SESSION_COO
 ```
 
 `Account` and `BillRecord` suppress sensitive fields from `repr()`.
+
+## MCP server
+
+Install the optional server dependency (official MCP Python SDK 2.2.x or later,
+below 3):
+
+```sh
+python -m pip install ".[mcp]"
+```
+
+Set `MYTNB_EMAIL` and `MYTNB_PASSWORD` in the environment of the process that
+launches your MCP client. Don't send them in chat or tool arguments, and don't
+commit them to configuration files. The server doesn't load `.env` automatically.
+
+Launch with `mytnb-mcp`, or use the module command if your Python scripts
+directory isn't on `PATH`:
+
+```sh
+python -m mytnb_mcp
+```
+
+This command waits for an MCP client on stdin; it isn't an interactive shell.
+stdout carries only protocol messages, while diagnostics go to stderr.
+
+For MCP clients that use the common `mcpServers` configuration format:
+
+```json
+{
+  "mcpServers": {
+    "mytnb-mcp": {
+      "command": "python",
+      "args": ["-m", "mytnb_mcp"]
+    }
+  }
+}
+```
+
+Use the absolute path to the Python interpreter where you installed the package
+if your MCP client uses a different environment. The launcher must pass the two
+credential environment variables to its child process; client-specific settings
+may be necessary for GUI launchers.
+
+| Tool | Arguments | Result |
+| --- | --- | --- |
+| `list_accounts` | None | `currency: "MYR"` and `accounts`, each with `account_id`, `account_no`, `description`, `total_payable` |
+| `get_bills` | `account_id` from `list_accounts`; optional `months` (1–1200, default 6, or null for all), `as_of` (`YYYY-MM-DD`, default today) | `currency: "MYR"` and `bills`, each with `date`, `amount`, `is_cancellation`, `is_reversal` |
+
+Amounts use decimal strings to preserve precision. `total_payable` can be null;
+bill flags can also be null when the portal doesn't supply them. The month
+window filters available history locally, not through a server-side history
+request. Bill results omit opaque billing tokens and exclude payments.
+
+Tool discovery doesn't contact myTNB. The first valid tool call logs in once;
+later calls reuse the in-memory session until shutdown or an authentication
+failure. The server serializes calls to protect the portal's account-profile
+session state and closes its HTTP client on shutdown. It checks that a bill's
+account belongs to the logged-in user before requesting its profile.
+
+Failures return MCP tool errors with safe messages. No call retries login or
+bypasses a challenge. After a session-expired error, a subsequent call can try
+authentication again; restart the server if you need to change its credentials.
+
+Account numbers, descriptions, balances and bill history are private data that
+the tools intentionally return to your MCP client and model provider. Only
+connect clients you trust. stdio keeps the transport local; it doesn't prevent
+the client from recording or forwarding tool results.
 
 ## Login flow (observed)
 
@@ -176,6 +245,11 @@ Mocked, offline (no live traffic, no real credentials), standard-library
 ```
 python -m unittest discover -s tests -t .
 ```
+
+For MCP coverage, install `python -m pip install ".[dev]"` before running the
+same command. Without the MCP extra, the suite skips MCP tests. These tests
+cover in-process tools, mocked SDK HTTP responses, and a real stdio subprocess
+handshake with no credentials or live portal requests.
 
 ## Limitations
 

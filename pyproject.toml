@@ -12,9 +12,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+mcp = [
+    "mcp>=2.2,<3",
+]
 dev = [
     "build>=1.2",
+    "mcp>=2.2,<3",
 ]
+
+[project.scripts]
+mytnb-mcp = "mytnb_mcp.server:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
