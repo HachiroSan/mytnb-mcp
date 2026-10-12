@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import date
@@ -17,8 +18,21 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from mytnb_sdk import MyTNBClient
+from mytnb_sdk import Account, MyTNBClient
 from mytnb_sdk.errors import AuthenticationChallengeError, AuthenticationError, MyTNBError
+
+
+def _parse_allowlist(value: str | None) -> frozenset[str] | None:
+    """Unset means unrestricted; every configured entry must be an ASCII number."""
+    if value is None:
+        return None
+    numbers = [item.strip() for item in value.split(",")]
+    if any(not item or not item.isascii() or not item.isdigit() for item in numbers):
+        raise ValueError(
+            "MYTNB_ALLOWED_ACCOUNT_NUMBERS must contain comma-separated account numbers "
+            "using digits 0-9, with no empty entries. Unset it to allow all owned accounts."
+        )
+    return frozenset(numbers)
 
 
 class _Session:
@@ -76,7 +90,14 @@ class _Session:
 
 def create_server(*, client_factory: Callable[[], MyTNBClient] = MyTNBClient) -> MCPServer:
     """Build a server without network access; authenticate on the first tool call."""
+    allowed_numbers = _parse_allowlist(os.environ.get("MYTNB_ALLOWED_ACCOUNT_NUMBERS"))
     session = _Session(client_factory)
+
+    def accessible_accounts(client: MyTNBClient) -> list[Account]:
+        accounts = client.list_accounts()
+        if allowed_numbers is None:
+            return accounts
+        return [account for account in accounts if account.account_no in allowed_numbers]
 
     @asynccontextmanager
     async def lifespan(server: MCPServer):
@@ -90,7 +111,8 @@ def create_server(*, client_factory: Callable[[], MyTNBClient] = MyTNBClient) ->
         instructions=(
             "Unofficial, read-only myTNB account and bill access. Results contain private "
             "account data. Never request credentials in tool arguments. Use account_id "
-            "from list_accounts for get_bills. No payments, PDFs or challenge bypass."
+            "from list_accounts for get_bills. Only accounts permitted by the server's "
+            "configured allowlist are accessible. No payments, PDFs or challenge bypass."
         ),
         lifespan=lifespan,
     )
@@ -100,7 +122,7 @@ def create_server(*, client_factory: Callable[[], MyTNBClient] = MyTNBClient) ->
 
     @server.tool(annotations=annotations)
     async def list_accounts() -> dict[str, Any]:
-        """List owned accounts, including opaque account_id and MYR balances."""
+        """List accessible owned accounts, including opaque account_id and MYR balances."""
         def operation(client: MyTNBClient) -> dict[str, Any]:
             return {"currency": "MYR", "accounts": [
                 {
@@ -111,7 +133,7 @@ def create_server(*, client_factory: Callable[[], MyTNBClient] = MyTNBClient) ->
                         str(account.total_payable) if account.total_payable is not None else None
                     ),
                 }
-                for account in client.list_accounts()
+                for account in accessible_accounts(client)
             ]}
 
         return await run_sync(partial(session.execute, operation))
@@ -122,7 +144,7 @@ def create_server(*, client_factory: Callable[[], MyTNBClient] = MyTNBClient) ->
         months: Annotated[int, Field(strict=True, ge=1, le=1200)] | None = 6,
         as_of: Annotated[str, Field(strict=True)] | None = None,
     ) -> dict[str, Any]:
-        """Read bills for an owned account. months (1–1200, default 6) filters locally;
+        """Read bills for an accessible owned account. months (1–1200, default 6) filters locally;
         null returns all available history. as_of is YYYY-MM-DD (default today).
         Amounts are exact decimal strings in MYR. Payments and billing tokens are omitted.
         """
@@ -139,10 +161,10 @@ def create_server(*, client_factory: Callable[[], MyTNBClient] = MyTNBClient) ->
 
         def operation(client: MyTNBClient) -> dict[str, Any]:
             account = next(
-                (item for item in client.list_accounts() if item.account_id == account_id), None,
+                (item for item in accessible_accounts(client) if item.account_id == account_id), None,
             )
             if account is None:
-                raise ToolError("Account not found in owned accounts; call list_accounts.")
+                raise ToolError("Account unavailable; call list_accounts for accessible accounts.")
             return {"currency": "MYR", "bills": [
                 {
                     "date": bill.date.isoformat(),
@@ -163,4 +185,13 @@ def main() -> None:
     # httpx INFO request logs can contain opaque account identifiers in URLs.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
-    create_server().run(transport="stdio")
+    try:
+        server = create_server()
+    except ValueError:
+        print(
+            "Invalid MYTNB_ALLOWED_ACCOUNT_NUMBERS: use comma-separated account numbers "
+            "(digits 0-9), with no empty entries; unset it to allow all owned accounts.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2) from None
+    server.run(transport="stdio")
